@@ -43,3 +43,14 @@ The types of take profit orders that can be placed
 * Check if there are any TP order placed in the opp direction in the range that tick just shifted and we'll find
 Alice's order over there
 * Now we can execute Alice's order as requirements are met.
+
+## Assumptions
+
+* We are not really going to be concerned about gas costs/gas limit.
+  * Bob is going to be the one paying the gas to execute Alice's order in this example.
+  * We are not going to limit how many orders we execute before of a price shift
+
+* We will ignore the slippage requirements for the placed limit order
+  * When Alice places her order, ideally - she should set some sort of slippage ( some sort of minimum token B to get back )
+
+* We'are not going to support pools that have native ETH token as one of the currencies. We only support ERC20-ERC20 pools.
