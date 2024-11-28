@@ -6,6 +6,7 @@ import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
 
 import {PoolId} from "v4-core/types/PoolId.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
@@ -18,8 +19,11 @@ import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 
 import {Currency} from "v4-core/types/Currency.sol";
 
+import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
+
 contract TakeProfitsHooks is BaseHook, ERC1155 {
     using StateLibrary for IPoolManager;
+    using FixedPointMathLib for uint256;
 
     // poolid => tickToSellAt => zeroForOne => inputAmount
     mapping(PoolId poolId => mapping(int24 tickToSellAt => mapping(bool zeroForOne => uint256 inputAmount)))
@@ -28,12 +32,13 @@ contract TakeProfitsHooks is BaseHook, ERC1155 {
     mapping(PoolId poolId => int24 lastTick) public lastTicks;
 
     mapping(uint256 positionId => uint256 outputClaimable)
-        public claimableOutputToken;
+        public claimableOutputTokens;
     mapping(uint256 positionId => uint256 claimsSupply)
         public claimTokensSupply;
 
     // errors
     error NotEnoughToClaim();
+    error NothingToClaim();
 
     constructor(
         IPoolManager _manager,
@@ -167,7 +172,49 @@ contract TakeProfitsHooks is BaseHook, ERC1155 {
         token.transfer(msg.sender, amountToCancel);
     }
 
-    function redeem() external {}
+    function redeem(
+        PoolKey calldata key,
+        int24 ticktoSellAt,
+        bool zeroForOne,
+        uint256 inputAmountToClaimFor
+    ) external {
+        int24 tick = getLowerUsableTick(ticktoSellAt, key.tickSpacing);
+        uint256 positionId = getPositionId(key, tick, zeroForOne);
+
+        // if not output tokens can be claimed yet, i.e. order hasn't filled
+        // throw error
+        if (claimableOutputTokens[positionId] == 0) revert NothingToClaim();
+
+        uint256 positionTokens = balanceOf(msg.sender, positionId);
+
+        if (positionTokens < inputAmountToClaimFor) revert NotEnoughToClaim();
+
+        uint256 totalClaimableOutputForPosition = claimableOutputTokens[
+            positionId
+        ];
+        uint256 totalInputAmountForPosition = claimTokensSupply[positionId];
+
+        // outputAmount = ( inputAmountToClaimFor * totalClaimableOutputForPosition ) / totalInputAmountForPosition
+        uint256 outputAmount = inputAmountToClaimFor.mulDivDown(
+            totalClaimableOutputForPosition,
+            totalInputAmountForPosition
+        );
+
+        // reduce the claimable output tokens amount
+        claimableOutputTokens[positionId] -= outputAmount;
+
+        // reduce the claim token total supply for position
+        claimTokensSupply[positionId] -= inputAmountToClaimFor;
+
+        // burn the nft
+        _burn(msg.sender, positionId, inputAmountToClaimFor);
+
+        // get the output token
+        Currency token = zeroForOne ? key.currency1 : key.currency0;
+
+        // transfer output token
+        token.transfer(msg.sender, outputAmount);
+    }
 
     // core order execution functions
 
@@ -183,7 +230,7 @@ contract TakeProfitsHooks is BaseHook, ERC1155 {
         // Case (1) - Tick has increased, i.e. `currentTick` > `lastTick`
         // Case (2) - TIck has decreased i.e. `currentTick` < `lastTick`
 
-        // If tick increases => Token ) price has increased
+        // If tick increases => Token0 price has increased
         // => We should check if we have orders looking to sell Token 0
         // i.e. orders that have zeroForOne = true
 
@@ -199,7 +246,20 @@ contract TakeProfitsHooks is BaseHook, ERC1155 {
         // i.e. check if we have any orders to sell ETH at new price that ETH is at now because of the increase
 
         if (currentTick > lastTick) {
-            executeOrder();
+            for (
+                int24 tick = lastTick;
+                tick < currentTick;
+                tick += key.tickSpacing
+            ) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][
+                    executeZeroForOne
+                ];
+                if (inputAmount > 0) {
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+
+                    return (true, currentTick);
+                }
+            }
         }
         // --------
         // Case (2)
@@ -211,11 +271,107 @@ contract TakeProfitsHooks is BaseHook, ERC1155 {
         // at ticks `currentTick` to `lastTick`
         // i.e. check if we have any orders to buy ETH at new price that ETH is at now because of the decrease
         else {
-            executeOrder();
+            for (
+                int24 tick = lastTick;
+                tick < currentTick;
+                tick -= key.tickSpacing
+            ) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][
+                    executeZeroForOne
+                ];
+                if (inputAmount > 0) {
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+
+                    return (true, currentTick);
+                }
+            }
         }
+
+        return (false, currentTick);
     }
 
-    function executeOrder() internal {}
+    function executeOrder(
+        PoolKey calldata key,
+        int24 tick,
+        bool zeroForOne,
+        uint256 inputAmount
+    ) internal {
+        BalanceDelta delta = swapAndSettleBalances(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(inputAmount),
+                sqrtPriceLimitX96: zeroForOne
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MIN_SQRT_PRICE - 1
+            })
+        );
+
+        // `inputAmount` has been deducted from this position
+        pendingOrders[key.toId()][tick][zeroForOne] -= inputAmount;
+
+        uint256 positionId = getPositionId(key, tick, zeroForOne);
+
+        uint256 outputAmount = zeroForOne
+            ? uint256(int256(delta.amount1()))
+            : uint256(int256(delta.amount0()));
+
+        claimableOutputTokens[positionId] += outputAmount;
+    }
+
+    function swapAndSettleBalances(
+        PoolKey calldata key,
+        IPoolManager.SwapParams memory params
+    ) internal returns (BalanceDelta) {
+        // conducting the swap inside the pool manager
+        BalanceDelta delta = poolManager.swap(key, params, "");
+
+        // if swap is zeroForOne
+        // send token0 to poolManager , receive token1 from poolManager
+        if (params.zeroForOne) {
+            // negative value -> token is transferred from user's wallet
+
+            if (delta.amount0() < 0) {
+                // settle it with poolManager
+                _settle(key.currency0, uint128(-delta.amount0()));
+            }
+
+            // positive value -> token is transfered from poolManager
+
+            if (delta.amount1() > 0) {
+                // take the token from poolManager
+                _take(key.currency1, uint128(delta.amount1()));
+            }
+        } else {
+            // negative value -> token is transferred from user's wallet
+
+            if (delta.amount1() < 0) {
+                // settle it with poolManager
+                _settle(key.currency1, uint128(delta.amount1()));
+            }
+
+            // positive value -> token is transfered from poolManager
+
+            if (delta.amount0() > 0) {
+                // take the token from poolManager
+                _take(key.currency0, uint128(delta.amount0()));
+            }
+        }
+
+        return delta;
+    }
+
+    function _settle(Currency currency, uint128 amount) internal {
+        poolManager.sync(currency);
+        // transfer the toke to poolManager
+        currency.transfer(address(poolManager), amount);
+        // notify the poolManager
+        poolManager.settle();
+    }
+
+    function _take(Currency currency, uint128 amount) internal {
+        poolManager.take(currency, address(this), amount);
+    }
 
     // view function
 
